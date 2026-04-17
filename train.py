@@ -47,7 +47,11 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
     spec.loader.exec_module(cfg_module)
     cfg = {k: getattr(cfg_module, k) for k in dir(cfg_module) if not k.startswith('_')}
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(
+        'mps' if torch.backends.mps.is_available()
+        else 'cuda' if torch.cuda.is_available()
+        else 'cpu'
+    )
     print(f'Using device: {device}')
 
     # Build model
@@ -109,6 +113,11 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
             torch.save(model.state_dict(), save_path)
             print(f'Saved checkpoint: {save_path}')
 
+    # Save final checkpoint
+    os.makedirs(work_dir, exist_ok=True)
+    final_path = os.path.join(work_dir, 'latest.pth')
+    torch.save(model.state_dict(), final_path)
+    print(f'Saved final checkpoint: {final_path}')
     print('\nTraining complete.')
 
 

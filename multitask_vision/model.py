@@ -129,7 +129,9 @@ class MultitaskVisionModel(BaseModel):
         data_samples: List[dict],
         active_tasks: Set[str],
     ) -> Dict[str, torch.Tensor]:
-        gt = self._collate_gt(data_samples)
+        # Infer device from input image
+        device = outputs['image'].device
+        gt = self._collate_gt(data_samples, device)
         all_losses: Dict[str, torch.Tensor] = {}
 
         for block_name in self.topo_order:
@@ -159,20 +161,20 @@ class MultitaskVisionModel(BaseModel):
         return preds
 
     @staticmethod
-    def _collate_gt(data_samples: List[dict]) -> Dict[str, Dict]:
+    def _collate_gt(data_samples: List[dict], device: torch.device) -> Dict[str, Dict]:
         gt: Dict[str, Dict] = {}
 
         if any('gt_bboxes' in s for s in data_samples):
             gt['detection'] = {
-                'gt_bboxes': [s['gt_bboxes'] for s in data_samples],
-                'gt_labels': [s['gt_labels'] for s in data_samples],
+                'gt_bboxes': [s['gt_bboxes'].to(device) for s in data_samples],
+                'gt_labels': [s['gt_labels'].to(device) for s in data_samples],
             }
         if any('gt_seg_map' in s for s in data_samples):
             gt['segmentation'] = {
-                'gt_seg_map': torch.stack([s['gt_seg_map'] for s in data_samples]),
+                'gt_seg_map': torch.stack([s['gt_seg_map'] for s in data_samples]).to(device),
             }
         if any('gt_depth_map' in s for s in data_samples):
             gt['depth'] = {
-                'gt_depth_map': torch.stack([s['gt_depth_map'] for s in data_samples]),
+                'gt_depth_map': torch.stack([s['gt_depth_map'] for s in data_samples]).to(device),
             }
         return gt

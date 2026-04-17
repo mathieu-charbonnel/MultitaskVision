@@ -9,9 +9,11 @@ from multitask_vision.registry import BLOCKS
 
 @BLOCKS.register_module()
 class AnchorFreeDetHead(nn.Module):
-    """Simple anchor-free detection head (FCOS-style).
+    """FCOS-style anchor-free detection head.
 
-    Predicts per-pixel class scores and bounding box regression at each FPN level.
+    For each FPN level, predicts per-pixel class scores and distances
+    to the four box edges (l, t, r, b). Positive locations are those
+    falling inside a ground truth box.
     """
 
     def __init__(self, num_classes: int, in_channels: int, num_levels: int = 4):
@@ -26,6 +28,7 @@ class AnchorFreeDetHead(nn.Module):
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 4, 1),
+            nn.ReLU(inplace=True),  # distances are positive
         )
 
     def forward(self, fpn_features: List[torch.Tensor]) -> Dict[str, List[torch.Tensor]]:
@@ -36,32 +39,55 @@ class AnchorFreeDetHead(nn.Module):
     def compute_loss(
         self, predictions: Dict[str, List[torch.Tensor]], targets: Dict
     ) -> Dict[str, torch.Tensor]:
-        """Simplified detection loss: focal-like cls + L1 reg on matched locations."""
+        gt_bboxes_list = targets['gt_bboxes']  # list of [N_i, 4] per image (normalized)
         gt_labels_list = targets['gt_labels']  # list of [N_i] per image
-        batch_size = len(gt_labels_list)
 
-        # Use only the finest FPN level for a simple loss
+        # Use only the finest FPN level
         cls_score = predictions['cls_scores'][0]  # [B, C, H, W]
         bbox_pred = predictions['bbox_preds'][0]  # [B, 4, H, W]
 
-        h, w = cls_score.shape[2:]
+        B, C, fh, fw = cls_score.shape
         device = cls_score.device
 
-        # Create target maps: for simplicity, place GT class at center of image
-        cls_target = torch.zeros(batch_size, h, w, dtype=torch.long, device=device)
-        for i, labels in enumerate(gt_labels_list):
-            if len(labels) > 0:
-                cls_target[i, h // 2, w // 2] = labels[0].long() + 1  # +1 for bg=0
+        # Feature map grid coordinates (normalized 0-1)
+        gy = (torch.arange(fh, device=device).float() + 0.5) / fh
+        gx = (torch.arange(fw, device=device).float() + 0.5) / fw
+        grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')  # [fh, fw]
 
-        # Classification loss (cross-entropy, treating 0 as background)
-        cls_score_flat = cls_score.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
-        cls_target_flat = cls_target.reshape(-1).clamp(0, self.num_classes - 1)
-        loss_cls = F.cross_entropy(cls_score_flat, cls_target_flat)
+        cls_targets = torch.zeros(B, fh, fw, dtype=torch.long, device=device)
+        reg_targets = torch.zeros(B, 4, fh, fw, device=device)
+        pos_mask = torch.zeros(B, fh, fw, dtype=torch.bool, device=device)
 
-        # Regression loss (dummy: L1 on all predictions toward zero)
-        loss_reg = bbox_pred.abs().mean()
+        for b in range(B):
+            bboxes = gt_bboxes_list[b]  # [N, 4]
+            labels = gt_labels_list[b]  # [N]
+            if len(bboxes) == 0:
+                continue
 
-        return {'loss_det_cls': loss_cls, 'loss_det_reg': loss_reg * 0.1}
+            for n in range(len(bboxes)):
+                x1, y1, x2, y2 = bboxes[n]
+                # Vectorized: mask of locations inside box
+                inside = (grid_x >= x1) & (grid_x <= x2) & (grid_y >= y1) & (grid_y <= y2)
+                cls_targets[b][inside] = labels[n].long() + 1
+                pos_mask[b] |= inside
+                # Regression targets: distances to edges
+                reg_targets[b, 0][inside] = (grid_x[inside] - x1)
+                reg_targets[b, 1][inside] = (grid_y[inside] - y1)
+                reg_targets[b, 2][inside] = (x2 - grid_x[inside])
+                reg_targets[b, 3][inside] = (y2 - grid_y[inside])
+
+        num_pos = pos_mask.sum().clamp(min=1).float()
+        loss_cls = F.cross_entropy(
+            cls_score, cls_targets.clamp(0, C - 1), reduction='sum'
+        ) / num_pos
+
+        if pos_mask.any():
+            pos_expanded = pos_mask.unsqueeze(1).expand_as(bbox_pred)
+            loss_reg = F.l1_loss(bbox_pred[pos_expanded], reg_targets[pos_expanded])
+        else:
+            loss_reg = bbox_pred.sum() * 0.0
+
+        return {'loss_det_cls': loss_cls, 'loss_det_reg': loss_reg}
 
 
 @BLOCKS.register_module()
