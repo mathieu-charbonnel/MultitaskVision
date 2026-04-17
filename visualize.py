@@ -31,53 +31,133 @@ def denormalize(img_tensor: torch.Tensor) -> np.ndarray:
     return np.clip(img, 0, 1)
 
 
-def visualize_detection(ax, img: np.ndarray, cls_scores, bbox_preds, threshold=0.3):
-    """Draw detected bounding boxes on image."""
+def _nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.4) -> torch.Tensor:
+    """Simple NMS. boxes: [N, 4] as (x1, y1, x2, y2), scores: [N]."""
+    if len(boxes) == 0:
+        return torch.zeros(0, dtype=torch.long)
+    order = scores.argsort(descending=True)
+    keep = []
+    while len(order) > 0:
+        i = order[0].item()
+        keep.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        xx1 = torch.max(boxes[i, 0], boxes[rest, 0])
+        yy1 = torch.max(boxes[i, 1], boxes[rest, 1])
+        xx2 = torch.min(boxes[i, 2], boxes[rest, 2])
+        yy2 = torch.min(boxes[i, 3], boxes[rest, 3])
+        inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+        area_rest = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
+        iou = inter / (area_i + area_rest - inter + 1e-6)
+        order = rest[iou < iou_threshold]
+    return torch.tensor(keep, dtype=torch.long)
+
+
+def visualize_detection(ax, img: np.ndarray, cls_scores, bbox_preds,
+                        score_threshold=0.15, nms_threshold=0.4, max_dets=20):
+    """Decode FCOS-style predictions into boxes and draw them."""
     ax.imshow(img)
     ax.set_title('Detection')
 
-    # Use finest FPN level
-    scores = cls_scores[0][0]  # [C, H, W]
-    bboxes = bbox_preds[0][0]  # [4, H, W]
+    scores = cls_scores[0][0].cpu()  # [C, H, W]
+    regs = bbox_preds[0][0].cpu()    # [4, H, W] — (l, t, r, b) in normalized coords
 
+    C, fh, fw = scores.shape
     h, w = img.shape[:2]
-    score_map = scores.softmax(dim=0)
-    max_scores, max_classes = score_map.max(dim=0)  # [H', W']
 
-    # Find high-confidence locations
-    sh, sw = max_scores.shape
-    for y in range(sh):
-        for x in range(sw):
-            score = max_scores[y, x].item()
-            cls_id = max_classes[y, x].item()
-            if score > threshold and cls_id < len(VOC_CLASSES):
-                # Map feature location to image coordinates
-                cx = x / sw * w
-                cy = y / sh * h
-                bw, bh = w * 0.15, h * 0.15
-                rect = patches.Rectangle(
-                    (cx - bw/2, cy - bh/2), bw, bh,
-                    linewidth=2, edgecolor='lime', facecolor='none'
-                )
-                ax.add_patch(rect)
-                ax.text(cx - bw/2, cy - bh/2 - 4,
-                        f'{VOC_CLASSES[cls_id]} {score:.2f}',
-                        color='lime', fontsize=7, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.1', facecolor='black', alpha=0.5))
+    # Build grid of center locations (normalized 0-1)
+    gy = (torch.arange(fh).float() + 0.5) / fh
+    gx = (torch.arange(fw).float() + 0.5) / fw
+    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')  # [fh, fw]
+
+    # Decode boxes: center - left/top, center + right/bottom
+    l, t, r, b = regs[0], regs[1], regs[2], regs[3]
+    x1 = (grid_x - l).clamp(0, 1) * w
+    y1 = (grid_y - t).clamp(0, 1) * h
+    x2 = (grid_x + r).clamp(0, 1) * w
+    y2 = (grid_y + b).clamp(0, 1) * h
+
+    # Per-class scores via softmax (class 0 = background)
+    score_map = scores.softmax(dim=0)  # [C, fh, fw]
+
+    # Collect candidate detections — skip class 0 (background)
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+
+    for cls_id in range(C):
+        cls_score = score_map[cls_id]  # [fh, fw]
+        mask = cls_score > score_threshold
+        if not mask.any():
+            continue
+        cls_boxes = torch.stack([x1[mask], y1[mask], x2[mask], y2[mask]], dim=1)
+        cls_sc = cls_score[mask]
+        all_boxes.append(cls_boxes)
+        all_scores.append(cls_sc)
+        all_classes.extend([cls_id] * len(cls_sc))
+
+    if not all_boxes:
+        ax.axis('off')
+        return
+
+    all_boxes = torch.cat(all_boxes, dim=0)
+    all_scores = torch.cat(all_scores, dim=0)
+    all_classes = torch.tensor(all_classes)
+
+    # NMS
+    keep = _nms(all_boxes, all_scores, nms_threshold)
+    if len(keep) > max_dets:
+        keep = keep[:max_dets]
+
+    colors = plt.cm.Set2(np.linspace(0, 1, 20))
+    for idx in keep:
+        bx1, by1, bx2, by2 = all_boxes[idx].numpy()
+        cls_id = all_classes[idx].item()
+        score = all_scores[idx].item()
+        color = colors[cls_id % len(colors)]
+
+        rect = patches.Rectangle(
+            (bx1, by1), bx2 - bx1, by2 - by1,
+            linewidth=2, edgecolor=color, facecolor='none'
+        )
+        ax.add_patch(rect)
+        label = VOC_CLASSES[cls_id] if cls_id < len(VOC_CLASSES) else str(cls_id)
+        ax.text(bx1, by1 - 4, f'{label} {score:.2f}',
+                color='white', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.15', facecolor=color, alpha=0.8))
     ax.axis('off')
 
 
+VOC_SEG_CLASSES = ['bg'] + VOC_CLASSES  # 0=background, 1-20=object classes
+
 def visualize_segmentation(ax, img: np.ndarray, seg_pred: torch.Tensor):
-    """Show segmentation prediction overlaid on image."""
+    """Show segmentation prediction overlaid on image with class labels."""
+    from PIL import Image as PILImage
     seg = seg_pred[0].argmax(dim=0).cpu().numpy()  # [H', W']
     seg_resized = np.array(
-        __import__('PIL').Image.fromarray(seg.astype(np.uint8)).resize(
-            (img.shape[1], img.shape[0]), __import__('PIL').Image.NEAREST
+        PILImage.fromarray(seg.astype(np.uint8)).resize(
+            (img.shape[1], img.shape[0]), PILImage.NEAREST
         )
     )
     ax.imshow(img)
-    ax.imshow(seg_resized, alpha=0.5, cmap='tab20', vmin=0, vmax=20)
+    cmap = plt.cm.tab20
+    ax.imshow(seg_resized, alpha=0.5, cmap=cmap, vmin=0, vmax=20)
     ax.set_title('Segmentation')
+
+    # Add legend for classes present in prediction
+    present = np.unique(seg_resized)
+    legend_patches = []
+    for cls_id in present:
+        if cls_id == 0 or cls_id == 255:
+            continue
+        color = cmap(cls_id / 20.0)
+        name = VOC_SEG_CLASSES[cls_id] if cls_id < len(VOC_SEG_CLASSES) else str(cls_id)
+        legend_patches.append(patches.Patch(facecolor=color, label=name))
+    if legend_patches:
+        ax.legend(handles=legend_patches, loc='lower right', fontsize=6,
+                  framealpha=0.7, handlelength=1, handleheight=1)
     ax.axis('off')
 
 
