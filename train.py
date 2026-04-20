@@ -54,6 +54,14 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
         print(f'Dataset: {ds.__class__.__name__}, size: {len(ds)}, tasks: {ds.tasks}')
 
     train_cfg = cfg['training']
+
+    # Apply QAT if configured
+    qat_cfg = train_cfg.get('qat')
+    if qat_cfg:
+        from multitask_vision.compression import apply_qat
+        apply_qat(model, qat_cfg)
+        print(f'QAT enabled: {qat_cfg}')
+
     loader = MultiDatasetLoader(
         datasets,
         batch_size=train_cfg['batch_size'],
