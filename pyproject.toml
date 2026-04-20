@@ -1,12 +1,15 @@
 [project]
 name = "multitask-vision"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 dependencies = [
-    "torch",
-    "torchvision",
+    "torch>=2.1.0,<2.2.0",
+    "torchvision>=0.16.0,<0.17.0",
     "mmengine",
-    "numpy",
+    "mmcv>=2.1.0,<2.2.0",
+    "mmdet>=3.0.0",
+    "mmsegmentation>=1.0.0",
+    "numpy<2",
     "Pillow",
     "scipy",
     "matplotlib",
@@ -16,6 +19,9 @@ dependencies = [
 dev = [
     "pytest",
 ]
+
+[tool.uv]
+find-links = ["https://download.openmmlab.com/mmcv/dist/cpu/torch2.1/index.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

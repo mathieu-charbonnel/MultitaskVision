@@ -4,6 +4,8 @@ Usage:
     uv run python train.py --config configs/det_seg_depth.py
 """
 import argparse
+import importlib.util
+import os
 import time
 
 import torch
@@ -11,41 +13,28 @@ import torch
 import multitask_vision  # noqa: F401 — trigger registration
 from multitask_vision.model import MultitaskVisionModel
 from multitask_vision.data.multi_dataset import MultiDatasetLoader
-from multitask_vision.registry import BLOCKS, LOSSES
+from multitask_vision.registry import DATASETS
 
 
-def build_model_from_config(cfg: dict, device: torch.device) -> MultitaskVisionModel:
-    model = MultitaskVisionModel(
-        blocks=cfg['blocks'],
-        losses=cfg['losses'],
-    )
-    return model.to(device)
+def load_config(config_path: str) -> dict:
+    spec = importlib.util.spec_from_file_location('config', config_path)
+    cfg_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg_module)
+    return {k: getattr(cfg_module, k) for k in dir(cfg_module) if not k.startswith('_')}
 
 
-def build_datasets(cfg: dict):
-    """Build dataset instances from config dicts."""
-    from multitask_vision.data.voc import VOCMultitaskDataset
-    from multitask_vision.data.nyu_depth import NYUDepthDataset
-
-    dataset_map = {
-        'VOCMultitaskDataset': VOCMultitaskDataset,
-        'NYUDepthDataset': NYUDepthDataset,
-    }
+def build_datasets(data_cfg: dict) -> list:
+    """Build datasets from config using the DATASETS registry."""
     datasets = []
-    for ds_cfg in cfg['datasets']:
+    for ds_cfg in data_cfg['datasets']:
+        ds_cfg = dict(ds_cfg)  # copy to avoid mutating config
         ds_type = ds_cfg.pop('type')
-        datasets.append(dataset_map[ds_type](**ds_cfg))
-        ds_cfg['type'] = ds_type  # restore
+        datasets.append(DATASETS.build(dict(type=ds_type, **ds_cfg)))
     return datasets
 
 
 def train(config_path: str, work_dir: str = 'work_dirs'):
-    # Load config as Python module
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('config', config_path)
-    cfg_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cfg_module)
-    cfg = {k: getattr(cfg_module, k) for k in dir(cfg_module) if not k.startswith('_')}
+    cfg = load_config(config_path)
 
     device = torch.device(
         'mps' if torch.backends.mps.is_available()
@@ -54,35 +43,36 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
     )
     print(f'Using device: {device}')
 
-    # Build model
-    model = build_model_from_config(cfg['model'], device)
+    model = MultitaskVisionModel(
+        blocks=cfg['model']['blocks'], losses=cfg['model']['losses'],
+    ).to(device)
     print(f'Model blocks: {list(model.block_modules.keys())}')
     print(f'Topological order: {model.topo_order}')
 
-    # Build datasets and loader
     datasets = build_datasets(cfg['data'])
     for ds in datasets:
         print(f'Dataset: {ds.__class__.__name__}, size: {len(ds)}, tasks: {ds.tasks}')
 
+    train_cfg = cfg['training']
     loader = MultiDatasetLoader(
         datasets,
-        batch_size=cfg['training']['batch_size'],
-        num_workers=cfg['training'].get('num_workers', 4),
-        sampling_strategy=cfg['training'].get('sampling_strategy', 'proportional'),
+        batch_size=train_cfg['batch_size'],
+        num_workers=train_cfg.get('num_workers', 4),
+        sampling_strategy=train_cfg.get('sampling_strategy', 'proportional'),
     )
 
-    # Optimizer
-    opt_cfg = cfg['training']['optimizer']
+    opt_cfg = train_cfg['optimizer']
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=opt_cfg.get('lr', 1e-4),
         weight_decay=opt_cfg.get('weight_decay', 0.01),
     )
 
-    max_iters = cfg['training']['max_iters']
-    log_interval = cfg['training'].get('log_interval', 50)
+    max_iters = train_cfg['max_iters']
+    log_interval = train_cfg.get('log_interval', 50)
+    save_interval = train_cfg.get('save_interval', 5000)
+    grad_clip = train_cfg.get('grad_clip')
 
-    # Training loop
     model.train()
     print(f'\nStarting training for {max_iters} iterations...\n')
 
@@ -98,6 +88,8 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
 
         optimizer.zero_grad()
         total_loss.backward()
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), **grad_clip)
         optimizer.step()
 
         if step % log_interval == 0:
@@ -106,18 +98,12 @@ def train(config_path: str, work_dir: str = 'work_dirs'):
             dt = time.time() - t0
             print(f'[{step}/{max_iters}] tasks={tasks} | {loss_str} | total={total_loss.item():.4f} | {dt:.2f}s')
 
-        if step % cfg['training'].get('save_interval', 5000) == 0:
-            import os
+        if step % save_interval == 0:
             os.makedirs(work_dir, exist_ok=True)
-            save_path = os.path.join(work_dir, f'step_{step}.pth')
-            torch.save(model.state_dict(), save_path)
-            print(f'Saved checkpoint: {save_path}')
+            torch.save(model.state_dict(), os.path.join(work_dir, f'step_{step}.pth'))
 
-    # Save final checkpoint
     os.makedirs(work_dir, exist_ok=True)
-    final_path = os.path.join(work_dir, 'latest.pth')
-    torch.save(model.state_dict(), final_path)
-    print(f'Saved final checkpoint: {final_path}')
+    torch.save(model.state_dict(), os.path.join(work_dir, 'latest.pth'))
     print('\nTraining complete.')
 
 

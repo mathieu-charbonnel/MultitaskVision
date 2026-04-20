@@ -5,5 +5,6 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 data/
-work_dirs/
-vis_results/
+work_dirs*/
+vis_results*/
+*.pth

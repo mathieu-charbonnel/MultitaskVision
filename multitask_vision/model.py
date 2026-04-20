@@ -6,16 +6,22 @@ import torch.nn as nn
 from mmengine.model import BaseModel
 from mmengine.registry import MODELS
 
-from multitask_vision.registry import BLOCKS, LOSSES
+from multitask_vision.registry import LOSSES, build_module
+from multitask_vision.adapters import ADAPTERS, DEFAULT_ADAPTERS, BaseAdapter
+
+
+def _build_adapter(adapter_cfg: Optional[dict], protocol: str) -> BaseAdapter:
+    if adapter_cfg is not None:
+        return ADAPTERS.build(adapter_cfg)
+    return DEFAULT_ADAPTERS.get(protocol, DEFAULT_ADAPTERS['native'])
 
 
 @MODELS.register_module()
 class MultitaskVisionModel(BaseModel):
     """Config-driven multitask model built as a DAG of blocks.
 
-    Each block declares its inputs (by name) and optionally a task.
-    The forward pass traverses the graph in topological order.
-    Only heads whose task matches the current batch's annotations are executed.
+    Fully block-agnostic: protocol adaptation (how to call forward, how to
+    compute losses) is delegated to adapters. No task-specific logic here.
     """
 
     def __init__(
@@ -28,6 +34,7 @@ class MultitaskVisionModel(BaseModel):
 
         self.block_modules = nn.ModuleDict()
         self.block_configs: Dict[str, dict] = {}
+        self.block_adapters: Dict[str, BaseAdapter] = {}
         self.topo_order: List[str] = []
 
         self._build_graph(blocks)
@@ -42,12 +49,13 @@ class MultitaskVisionModel(BaseModel):
         for blk in blocks:
             name = blk['name']
             inputs = blk['inputs']
-            module = BLOCKS.build(dict(type=blk['type'], **blk.get('args', {})))
+            module, protocol = build_module(blk['type'], blk.get('args', {}))
+            protocol = blk.get('protocol', protocol)
+
             self.block_modules[name] = module
-            self.block_configs[name] = dict(
-                inputs=inputs,
-                task=blk.get('task', None),
-            )
+            self.block_configs[name] = dict(inputs=inputs, task=blk.get('task', None))
+            self.block_adapters[name] = _build_adapter(blk.get('adapter', None), protocol)
+
             deps = {inp.split('.')[0] for inp in inputs if inp != 'image'}
             adjacency[name] = deps
 
@@ -78,10 +86,8 @@ class MultitaskVisionModel(BaseModel):
     def _resolve_input(self, input_name: str, outputs: Dict[str, Any]) -> Any:
         if input_name == 'image':
             return outputs['image']
-
         parts = input_name.split('.', 1)
         block_out = outputs[parts[0]]
-
         if len(parts) == 1:
             return block_out
         return block_out[parts[1]]
@@ -93,30 +99,24 @@ class MultitaskVisionModel(BaseModel):
         mode: str = 'loss',
     ) -> Union[Dict[str, torch.Tensor], Dict[str, Any]]:
         active_tasks = self._get_active_tasks(data_samples)
-
         outputs: Dict[str, Any] = {'image': inputs}
 
         for block_name in self.topo_order:
             cfg = self.block_configs[block_name]
-            task = cfg['task']
-
-            if task is not None and task not in active_tasks:
+            if cfg['task'] is not None and cfg['task'] not in active_tasks:
                 continue
 
             block_inputs = [self._resolve_input(inp, outputs) for inp in cfg['inputs']]
-            module = self.block_modules[block_name]
-
-            if len(block_inputs) == 1:
-                outputs[block_name] = module(block_inputs[0])
-            else:
-                outputs[block_name] = module(*block_inputs)
+            adapter = self.block_adapters[block_name]
+            outputs[block_name] = adapter.call_forward(
+                self.block_modules[block_name], block_inputs
+            )
 
         if mode == 'loss':
             return self._compute_losses(outputs, data_samples, active_tasks)
         elif mode == 'predict':
             return self._gather_predictions(outputs, active_tasks)
-        else:
-            return outputs
+        return outputs
 
     def _get_active_tasks(self, data_samples: Optional[List[dict]]) -> Set[str]:
         if not data_samples:
@@ -124,12 +124,8 @@ class MultitaskVisionModel(BaseModel):
         return set(data_samples[0].get('tasks', []))
 
     def _compute_losses(
-        self,
-        outputs: Dict[str, Any],
-        data_samples: List[dict],
-        active_tasks: Set[str],
+        self, outputs: Dict[str, Any], data_samples: List[dict], active_tasks: Set[str],
     ) -> Dict[str, torch.Tensor]:
-        # Infer device from input image
         device = outputs['image'].device
         gt = self._collate_gt(data_samples, device)
         all_losses: Dict[str, torch.Tensor] = {}
@@ -140,9 +136,11 @@ class MultitaskVisionModel(BaseModel):
             if task is None or task not in active_tasks:
                 continue
 
-            module = self.block_modules[block_name]
-            raw = module.compute_loss(outputs[block_name], gt.get(task, {}))
-
+            adapter = self.block_adapters[block_name]
+            raw = adapter.compute_loss(
+                self.block_modules[block_name], outputs[block_name],
+                gt.get(task, {}), outputs['image'],
+            )
             if task in self.loss_fns:
                 raw = self.loss_fns[task](raw)
             all_losses.update(raw)
@@ -150,31 +148,48 @@ class MultitaskVisionModel(BaseModel):
         return all_losses
 
     def _gather_predictions(
-        self, outputs: Dict[str, Any], active_tasks: Set[str]
+        self, outputs: Dict[str, Any], active_tasks: Set[str],
     ) -> Dict[str, Any]:
-        preds = {}
-        for block_name in self.topo_order:
-            cfg = self.block_configs[block_name]
-            task = cfg['task']
-            if task is not None and task in active_tasks:
-                preds[task] = outputs[block_name]
-        return preds
+        return {
+            cfg['task']: outputs[name]
+            for name in self.topo_order
+            if (cfg := self.block_configs[name])['task'] in active_tasks
+        }
 
     @staticmethod
     def _collate_gt(data_samples: List[dict], device: torch.device) -> Dict[str, Dict]:
-        gt: Dict[str, Dict] = {}
+        """Collate GT from data samples into per-task dicts.
 
-        if any('gt_bboxes' in s for s in data_samples):
-            gt['detection'] = {
-                'gt_bboxes': [s['gt_bboxes'].to(device) for s in data_samples],
-                'gt_labels': [s['gt_labels'].to(device) for s in data_samples],
-            }
-        if any('gt_seg_map' in s for s in data_samples):
-            gt['segmentation'] = {
-                'gt_seg_map': torch.stack([s['gt_seg_map'] for s in data_samples]).to(device),
-            }
-        if any('gt_depth_map' in s for s in data_samples):
-            gt['depth'] = {
-                'gt_depth_map': torch.stack([s['gt_depth_map'] for s in data_samples]).to(device),
-            }
+        Groups all GT keys by the task they belong to. The mapping from
+        GT key to task is defined by each sample's 'tasks' field and a
+        prefix convention: keys starting with 'gt_' are collected.
+        """
+        tasks = data_samples[0].get('tasks', [])
+        gt: Dict[str, Dict] = {task: {} for task in tasks}
+
+        # Collect all gt_ keys from samples
+        gt_keys = [k for k in data_samples[0] if k.startswith('gt_')]
+
+        for key in gt_keys:
+            values = [s[key] for s in data_samples]
+            # Stack if all tensors have the same shape, otherwise keep as list
+            if isinstance(values[0], torch.Tensor):
+                try:
+                    stacked = torch.stack(values).to(device)
+                except RuntimeError:
+                    # Variable-size tensors — keep as list
+                    stacked = [v.to(device) for v in values]
+            else:
+                stacked = values
+
+            # Assign to the appropriate task based on the dataset's gt_key_tasks
+            # mapping, or broadcast to all tasks if no mapping exists
+            task_for_key = data_samples[0].get('gt_key_tasks', {}).get(key)
+            if task_for_key:
+                gt[task_for_key][key] = stacked
+            else:
+                # Broadcast to all tasks — adapters will pick what they need
+                for task in tasks:
+                    gt[task][key] = stacked
+
         return gt
